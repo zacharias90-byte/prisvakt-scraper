@@ -1,0 +1,17 @@
+{
+  "name": "prisvakt-scraper",
+  "version": "1.0.0",
+  "description": "Scraper fyri brennievnisprísir í Føroyum",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "puppeteer": "^21.0.0",
+    "node-cron": "^3.0.3",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
