@@ -1,40 +1,171 @@
-const puppeteer = require("puppeteer");
-const cron = require("node-cron");
+const https = require("https");
+const http = require("http");
 const express = require("express");
-const fs = require("fs");
- 
+
 const app = express();
 const PORT = process.env.PORT || 3000;
-const PRICES_FILE = "prices.json";
- 
+
 // ── KENDAR PRÍSIR (fallback) ──────────────────────
 const KNOWN_PRICES = {
-  Thomsen: { gassoil: "10.350", diesel: null,    bensin: null,    updatedAt: "26/03/2026" },
-  Magn:    { gassoil: "12.313", diesel: "14.360", bensin: "14.700", updatedAt: "31/03/2026" },
-  Effo:    { gassoil: "12.313", diesel: "14.360", bensin: "14.700", updatedAt: "01/04/2026" }
+  Thomsen: { gassoil: "10.350", diesel: null,     bensin: null,     updatedAt: "26/03/2026" },
+  Magn:    { gassoil: "12.313", diesel: "14.360",  bensin: "14.700", updatedAt: "31/03/2026" },
+  Effo:    { gassoil: "12.313", diesel: "14.360",  bensin: "14.700", updatedAt: "01/04/2026" }
 };
- 
-// ── THOMSEN (vanlig scraping virkar) ─────────────
-async function scrapeThomsen(page) {
-  try {
-    await page.goto("https://thomsen.fo/oljuprisur", { waitUntil: "domcontentloaded", timeout: 15000 });
-    const result = await page.evaluate(() => {
-      const h2s = Array.from(document.querySelectorAll("h2"));
-      for (const h2 of h2s) {
-        const m = h2.textContent.match(/DAGSPRÍSUR\s+([\d,\.]+)\s*kr/i);
-        if (m) {
-          const dateEl = document.querySelector("table td");
-          return {
-            gassoil: m[1].replace(",", "."),
-            updatedAt: dateEl ? dateEl.textContent.trim() : ""
-          };
-        }
+
+let cachedPrices = null;
+let lastFetch = null;
+
+// ── HTTP fetch helper ─────────────────────────────
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
+    const req = lib.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; Prisvakt/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*"
+      },
+      timeout: 12000
+    }, (res) => {
+      // Follow redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchUrl(res.headers.location).then(resolve).catch(reject);
       }
-      return null;
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => resolve(data));
     });
-    if (result && parseFloat(result.gassoil) > 5) {
-      console.log("Thomsen OK:", result.gassoil);
-      return { source: "Thomsen", gassoil: parseFloat(result.gassoil).toFixed(3), diesel: null, bensin: null, updatedAt: result.updatedAt };
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
+  });
+}
+
+// ── MAGN ─────────────────────────────────────────
+// Magn uses Webflow CMS - prices are in the HTML as text
+async function scrapeMagn() {
+  try {
+    const html = await fetchUrl("https://www.magn.fo/oljuprisir");
+
+    // Extract latest date block - look for price patterns in HTML
+    // Magn shows prices like "14.700" and "14.360" as numbers in the page
+
+    // Find all price-like numbers in the page (format: XX.XXX)
+    const pricePattern = /\b(\d{1,2}\.\d{3})\b/g;
+    const datePattern = /(\d{1,2})\s*\.\s*(March|April|May|June|July|August|September|October|November|December|January|February)\s*(\d{4})/i;
+
+    // Find date
+    const dateMatch = html.match(datePattern);
+    let updatedAt = "";
+    if (dateMatch) {
+      updatedAt = dateMatch[1] + ". " + dateMatch[2] + " " + dateMatch[3];
+    }
+
+    // Find bensin, diesel, gassolja sections
+    // Look for the first occurrence of each near price indicators
+    let bensin = null, diesel = null, gassoil = null;
+
+    // Bensin section - find "Bensin" followed by price
+    const bensinMatch = html.match(/Bensin[\s\S]{0,500}?\b(1[0-9]\.\d{3})\b/);
+    if (bensinMatch) bensin = bensinMatch[1];
+
+    // Diesel section
+    const dieselMatch = html.match(/Diesel[\s\S]{0,300}?\b(1[0-9]\.\d{3})\b/);
+    if (dieselMatch) diesel = dieselMatch[1];
+
+    // Gassolja - pr 1000 litrar, so value like 12.313
+    const gasMatch = html.match(/Gassolja[\s\S]{0,500}?\b(1[0-2]\.\d{3})\b/);
+    if (gasMatch) gassoil = gasMatch[1];
+
+    // Validate
+    const g = parseFloat(gassoil);
+    const d = parseFloat(diesel);
+    const b = parseFloat(bensin);
+
+    if (g > 5 && g < 25 && d > 5 && b > 5) {
+      console.log("Magn OK:", gassoil, diesel, bensin, updatedAt);
+      return { source: "Magn", gassoil, diesel, bensin, updatedAt };
+    }
+    throw new Error("Prices out of range: " + gassoil + "/" + diesel + "/" + bensin);
+  } catch (e) {
+    console.log("Magn feilst:", e.message, "— nýti kendar prísir");
+    return { source: "Magn", ...KNOWN_PRICES.Magn };
+  }
+}
+
+// ── EFFO ─────────────────────────────────────────
+async function scrapeEffo() {
+  try {
+    const html = await fetchUrl("https://www.effo.fo/prisir/");
+
+    // Effo shows prices in a table with dates as h5 headers
+    // Look for the latest date section and extract prices
+
+    // Find date (format: "1. apríl 2026" or "1. April 2026")
+    const datePattern = /(\d{1,2})\.\s+(april|mars|februar|januar|mai|juni|juli|august|september|oktober|november|desember|January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i;
+    const dateMatch = html.match(datePattern);
+    let updatedAt = "";
+    if (dateMatch) {
+      updatedAt = dateMatch[1] + "/" + (dateMatch[3]);
+    }
+
+    // Extract from table - look for KR. values after known fuel types
+    // Pattern: "Blýfrítt | 14,70 KR." or similar
+    let bensin = null, diesel = null, gassoil = null;
+
+    // Blýfrítt (bensin)
+    const bensinMatch = html.match(/Blýfrítt[\s\S]{0,200}?(1[0-9][,\.]\d{2,3})\s*KR/i);
+    if (bensinMatch) bensin = bensinMatch[1].replace(",", ".");
+
+    // Diesel
+    const dieselMatch = html.match(/(?<!\w)Diesel[\s\S]{0,200}?(1[0-9][,\.]\d{2,3})\s*KR/i);
+    if (dieselMatch) diesel = dieselMatch[1].replace(",", ".");
+
+    // Gassolja - pr 1000 litrar
+    const gasMatch = html.match(/Gassolja[\s\S]{0,300}?(1[0-2][,\.]\d{3})\s*KR/i);
+    if (gasMatch) {
+      const raw = parseFloat(gasMatch[1].replace(",", "."));
+      gassoil = raw > 100 ? (raw / 1000).toFixed(3) : raw.toFixed(3);
+    }
+
+    // Also try simpler pattern for gassolja
+    if (!gassoil) {
+      const gasMatch2 = html.match(/12[,\.](\d{3})\s*KR/i);
+      if (gasMatch2) gassoil = "12." + gasMatch2[1];
+    }
+
+    const g = parseFloat(gassoil);
+    const d = parseFloat(diesel);
+    const b = parseFloat(bensin);
+
+    if (g > 5 && g < 25 && d > 5 && b > 5) {
+      console.log("Effo OK:", gassoil, diesel, bensin, updatedAt);
+      return { source: "Effo", gassoil, diesel, bensin, updatedAt };
+    }
+    throw new Error("Prices out of range: " + gassoil + "/" + diesel + "/" + bensin);
+  } catch (e) {
+    console.log("Effo feilst:", e.message, "— nýti kendar prísir");
+    return { source: "Effo", ...KNOWN_PRICES.Effo };
+  }
+}
+
+// ── THOMSEN ───────────────────────────────────────
+async function scrapeThomsen() {
+  try {
+    const html = await fetchUrl("https://thomsen.fo/oljuprisur");
+
+    // Look for price pattern
+    const priceMatch = html.match(/DAGSPRÍSUR\s+([\d,\.]+)\s*kr/i) ||
+                       html.match(/([\d,\.]+)\s*kr\.?\s*(?:pr\.?\s*litr|\/L)/i) ||
+                       html.match(/\b(7|8|9|10|11)\.\d{2,3}\b/);
+
+    const dateMatch = html.match(/(\d{1,2}[\.\/]\d{1,2}[\.\/]\d{4})/);
+
+    if (priceMatch) {
+      const val = parseFloat(priceMatch[1].replace(",", "."));
+      if (val > 5 && val < 20) {
+        const updatedAt = dateMatch ? dateMatch[1] : "";
+        console.log("Thomsen OK:", val.toFixed(3));
+        return { source: "Thomsen", gassoil: val.toFixed(3), diesel: null, bensin: null, updatedAt };
+      }
     }
     throw new Error("Fann ikki prís");
   } catch (e) {
@@ -42,160 +173,58 @@ async function scrapeThomsen(page) {
     return { source: "Thomsen", ...KNOWN_PRICES.Thomsen };
   }
 }
- 
-// ── EFFO (JavaScript-rendered — nýtir Puppeteer) ─
-async function scrapeEffo(page) {
+
+// ── FETCH ALL PRICES ──────────────────────────────
+async function fetchAllPrices() {
+  console.log("Sækji prísir...", new Date().toISOString());
   try {
-    await page.goto("https://www.effo.fo/prisir/", { waitUntil: "networkidle2", timeout: 30000 });
-    // Bíð eftir at Vue.js renderar prísirnar
-    await page.waitForSelector(".fuel-price--total", { timeout: 15000 });
-    const result = await page.evaluate(() => {
-      const items = document.querySelectorAll(".fuel-prices--elm");
-      const prices = {};
-      items.forEach(item => {
-        const type = item.querySelector(".fuel-price--type")?.textContent?.trim()?.toLowerCase() || "";
-        const total = item.querySelector(".fuel-price--total")?.textContent?.trim() || "";
-        const m = total.match(/([\d,\.]+)/);
-        if (!m) return;
-        const val = parseFloat(m[1].replace(",", "."));
-        if (type.includes("diesel") && !type.includes("báta")) prices.diesel = val;
-        else if (type.includes("blý") || type.includes("bensin") || type.includes("oktan")) prices.bensin = val;
-        else if (type.includes("gass")) {
-          prices.gassoil = val > 100 ? val / 1000 : val;
-        }
-      });
-      // Finn dato
-      const dateEl = document.querySelector(".fuel-prices-block h5, .fuel-prices h5");
-      return { ...prices, updatedAt: dateEl ? dateEl.textContent.trim() : "" };
-    });
-    if (result.gassoil && result.gassoil > 5) {
-      console.log("Effo OK:", result);
-      return {
-        source: "Effo",
-        gassoil: result.gassoil.toFixed(3),
-        diesel: result.diesel ? result.diesel.toFixed(3) : null,
-        bensin: result.bensin ? result.bensin.toFixed(3) : null,
-        updatedAt: result.updatedAt
-      };
-    }
-    throw new Error("Ógildur prísur: " + result.gassoil);
-  } catch (e) {
-    console.log("Effo feilst:", e.message, "— nýti kendar prísir");
-    return { source: "Effo", ...KNOWN_PRICES.Effo };
-  }
-}
- 
-// ── MAGN (JavaScript-rendered — nýtir Puppeteer) ─
-async function scrapeMagn(page) {
-  try {
-    await page.goto("https://magn.fo/oljuprisir", { waitUntil: "networkidle2", timeout: 30000 });
-    await new Promise(r => setTimeout(r, 3000)); // Bíð eftir JS
-    const result = await page.evaluate(() => {
-      // Prova ymiskar CSS selectors
-      const selectors = [".fuel-price--total", ".price", ".pris", "[class*='price']", "[class*='pris']"];
-      const prices = {};
-      for (const sel of selectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          els.forEach(el => {
-            const text = el.textContent.trim();
-            const parent = el.closest("[class*='fuel'], [class*='olja'], [class*='oil']");
-            const typeEl = parent?.querySelector("[class*='type'], [class*='name'], [class*='slag']");
-            const type = typeEl?.textContent?.toLowerCase() || "";
-            const m = text.match(/([\d,\.]+)/);
-            if (!m) return;
-            const val = parseFloat(m[1].replace(",", "."));
-            if (val < 5 || val > 10000) return;
-            if (type.includes("diesel")) prices.diesel = val > 100 ? val / 1000 : val;
-            else if (type.includes("blý") || type.includes("bensin")) prices.bensin = val > 100 ? val / 1000 : val;
-            else if (type.includes("gass")) prices.gassoil = val > 100 ? val / 1000 : val;
-          });
-          if (prices.gassoil) break;
-        }
-      }
-      // Fallback: finn allar talur á síðuni
-      if (!prices.gassoil) {
-        const allText = document.body.innerText;
-        const nums = [...allText.matchAll(/(\d+)[,\.](\d{3})/g)].map(m => parseFloat(m[0].replace(",", ".")));
-        const valid = nums.filter(n => n > 8 && n < 25);
-        if (valid.length >= 1) prices.gassoil = valid[0];
-        if (valid.length >= 2) prices.diesel = valid[1];
-        if (valid.length >= 3) prices.bensin = valid[2];
-      }
-      return prices;
-    });
-    if (result.gassoil && result.gassoil > 5) {
-      console.log("Magn OK:", result);
-      return {
-        source: "Magn",
-        gassoil: result.gassoil.toFixed(3),
-        diesel: result.diesel ? result.diesel.toFixed(3) : null,
-        bensin: result.bensin ? result.bensin.toFixed(3) : null,
-        updatedAt: new Date().toLocaleDateString("fo-FO")
-      };
-    }
-    throw new Error("Ógildur prísur");
-  } catch (e) {
-    console.log("Magn feilst:", e.message, "— nýti kendar prísir");
-    return { source: "Magn", ...KNOWN_PRICES.Magn };
-  }
-}
- 
-// ── KEYRI SCRAPING ────────────────────────────────
-async function runScraper() {
-  console.log("Byrjar scraping:", new Date().toISOString());
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-      headless: "new"
-    });
-    const page = await browser.newPage();
-    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36");
- 
-    const thomsen = await scrapeThomsen(page);
-    const effo = await scrapeEffo(page);
-    const magn = await scrapeMagn(page);
- 
+    const [thomsen, magn, effo] = await Promise.all([
+      scrapeThomsen(),
+      scrapeMagn(),
+      scrapeEffo()
+    ]);
     const result = {
       fetchedAt: new Date().toISOString(),
       sources: [thomsen, magn, effo]
     };
- 
-    fs.writeFileSync(PRICES_FILE, JSON.stringify(result, null, 2));
-    console.log("Prísir goymdar:", PRICES_FILE);
+    cachedPrices = result;
+    lastFetch = new Date();
+    console.log("Prísir sóttir:", JSON.stringify(result));
+    return result;
   } catch (e) {
-    console.error("Scraping villa:", e.message);
-  } finally {
-    if (browser) await browser.close();
-  }
-}
- 
-// ── EXPRESS SERVER ────────────────────────────────
-app.get("/api/fuel-prices", (req, res) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Cache-Control", "public, max-age=3600");
-  if (fs.existsSync(PRICES_FILE)) {
-    res.json(JSON.parse(fs.readFileSync(PRICES_FILE)));
-  } else {
-    // Fallback um ongin fil er til
-    res.json({
+    console.error("Feil við at sækja prísir:", e.message);
+    return {
       fetchedAt: new Date().toISOString(),
       sources: [
         { source: "Thomsen", ...KNOWN_PRICES.Thomsen },
         { source: "Magn",    ...KNOWN_PRICES.Magn    },
         { source: "Effo",    ...KNOWN_PRICES.Effo    }
       ]
-    });
+    };
   }
+}
+
+// ── API ENDPOINT ──────────────────────────────────
+app.get("/api/fuel-prices", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // Return cached if less than 30 min old
+  if (cachedPrices && lastFetch && (Date.now() - lastFetch) < 30 * 60 * 1000) {
+    return res.json(cachedPrices);
+  }
+
+  const prices = await fetchAllPrices();
+  res.json(prices);
 });
- 
-app.get("/", (req, res) => res.send("Prísvakt scraper keyrir!"));
- 
-app.listen(PORT, () => {
-  console.log("Server keyrir á port", PORT);
-  // Keyri straks
-  runScraper();
-  // Keyri hvønn 6. tíma: kl. 00, 06, 12, 18
-  cron.schedule("0 */6 * * *", runScraper);
+
+app.get("/health", (req, res) => res.json({ ok: true, lastFetch }));
+
+// ── START ─────────────────────────────────────────
+app.listen(PORT, async () => {
+  console.log("Server koyrir á port", PORT);
+  // Fetch immediately on start
+  await fetchAllPrices();
+  // Then every 3 hours
+  setInterval(fetchAllPrices, 3 * 60 * 60 * 1000);
 });
