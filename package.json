@@ -7,8 +7,6 @@
     "start": "node scraper.js"
   },
   "dependencies": {
-    "puppeteer": "^21.0.0",
-    "node-cron": "^3.0.3",
     "express": "^4.18.2"
   },
   "engines": {
